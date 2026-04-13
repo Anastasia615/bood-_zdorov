@@ -2566,6 +2566,38 @@ function endAssistantSpeech() {
   }
 }
 
+function stopActiveAudioPlayback() {
+  if (!activeAudio) {
+    return;
+  }
+
+  try {
+    activeAudio.pause();
+  } catch (e) {
+    // ignore pause race
+  }
+
+  try {
+    activeAudio.currentTime = 0;
+  } catch (e) {
+    // ignore seek race
+  }
+
+  try {
+    activeAudio.removeAttribute("src");
+  } catch (e) {
+    // ignore attribute race
+  }
+
+  try {
+    activeAudio.load();
+  } catch (e) {
+    // ignore load race
+  }
+
+  activeAudio = null;
+}
+
 function speakWithBrowser(text) {
   return new Promise((resolve) => {
     if (!window.speechSynthesis) {
@@ -2578,6 +2610,8 @@ function speakWithBrowser(text) {
     } catch (e) {
       // ignore cancel race
     }
+
+    stopActiveAudioPlayback();
 
     const utter = new SpeechSynthesisUtterance(text);
     utter.lang = "ru-RU";
@@ -2636,19 +2670,15 @@ async function speakWithYandex(text) {
           return;
         }
         settled = true;
-        try {
-          audio.pause();
-          audio.currentTime = 0;
-        } catch (e) {
-          // ignore
-        }
-        activeAudio = null;
+        stopActiveAudioPlayback();
         reject(new Error("audio_playback_timeout"));
       }, TTS_PLAYBACK_TIMEOUT_MS);
 
       const cleanup = () => {
         clearTimeout(timeoutId);
-        activeAudio = null;
+        if (activeAudio === audio) {
+          activeAudio = null;
+        }
       };
 
       audio.onended = () => {
@@ -2684,15 +2714,7 @@ async function speakWithYandex(text) {
     const recentCancel = Date.now() - playbackCancelledAt < 1800;
     const manualMicStop = Date.now() - manualMicStopAt < 1800;
 
-    if (activeAudio) {
-      try {
-        activeAudio.pause();
-        activeAudio.currentTime = 0;
-      } catch (pauseError) {
-        // ignore pause race
-      }
-      activeAudio = null;
-    }
+    stopActiveAudioPlayback();
 
     if (errorText.includes("audio_playback_failed") && (recentCancel || manualMicStop || !micActive)) {
       return true;
@@ -2723,7 +2745,8 @@ async function speak(text) {
   lastAssistantSpokenAt = Date.now();
   const yandexOk = await speakWithYandex(prepared);
   if (!yandexOk) {
-    await speakWithBrowser(prepared);
+    stopActiveAudioPlayback();
+    await reportClientLog("tts", "Yandex TTS unavailable; browser fallback disabled");
   }
 }
 
