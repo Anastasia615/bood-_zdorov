@@ -148,11 +148,20 @@ const specialtyRules = {
     "гематом",
     "отек",
     "сустав",
+    "ног",
+    "рук",
+    "бедр",
+    "голен",
+    "голеностоп",
     "колен",
     "плеч",
     "локт",
     "стоп",
     "лодыж",
+    "щиколот",
+    "тазобед",
+    "кист",
+    "палец",
     "пятк",
     "позвоноч",
     "осанк",
@@ -278,6 +287,7 @@ const STT_TARGET_SAMPLE_RATE = 16000;
 const STT_CONTINUE_MIN_RMS_THRESHOLD = 0.018;
 const STT_CONTINUE_RMS_MULTIPLIER = 1.9;
 const STT_MIN_CAPTURE_BEFORE_SILENCE_MS = 280;
+const TTS_PLAYBACK_TIMEOUT_MS = 15000;
 const LOW_SIGNAL_UTTERANCES = new Set([
   "вот",
   "ну",
@@ -353,11 +363,58 @@ const EMERGENCY_TRAUMA_CUE_FRAGMENTS = [
   "невозможно двиг",
   "очень сильная боль"
 ];
+const ORTHO_BODY_PART_CUE_FRAGMENTS = [
+  "ног",
+  "рук",
+  "бедр",
+  "голен",
+  "голеностоп",
+  "колен",
+  "плеч",
+  "локт",
+  "стоп",
+  "лодыж",
+  "щиколот",
+  "тазобед",
+  "кист",
+  "палец",
+  "пятк",
+  "сустав",
+  "спин",
+  "поясниц",
+  "ше",
+  "позвоноч",
+  "осанк"
+];
+const ORTHO_COMPLAINT_CUE_FRAGMENTS = [
+  "бол",
+  "ноет",
+  "тян",
+  "ломит",
+  "скован",
+  "хруст",
+  "щелка",
+  "отек",
+  "опух",
+  "онемен",
+  "не могу согн",
+  "не могу разогн",
+  "не сгиб",
+  "не разгиб",
+  "не поднима"
+];
 const PLANNED_ORTHO_CUE_FRAGMENTS = [
   "хронич",
   "давно",
   "несколько недель",
   "несколько месяцев",
+  "болит нога",
+  "болит рука",
+  "болит колено",
+  "болит стопа",
+  "болит голеностоп",
+  "болит плечо",
+  "болит локоть",
   "болит спина",
   "болит поясница",
   "сустав",
@@ -408,6 +465,78 @@ function dayLabel(token) {
 function dayLabelForSpeech(token) {
   const date = dateFromToken(token);
   return date.toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
+}
+
+function dayLabelWithWeekday(token) {
+  const date = dateFromToken(token);
+  return date.toLocaleDateString("ru-RU", { weekday: "long", day: "numeric", month: "long" });
+}
+
+function weekdayMatch(text) {
+  const t = normalize(text);
+  const weekdayVariants = [
+    { index: 1, variants: ["понедель", "пн"] },
+    { index: 2, variants: ["вторник", "вторн", "вт"] },
+    { index: 3, variants: ["сред", "ср"] },
+    { index: 4, variants: ["четвер", "чт"] },
+    { index: 5, variants: ["пятниц", "пт"] },
+    { index: 6, variants: ["суббот", "сб"] },
+    { index: 0, variants: ["воскрес", "вс"] }
+  ];
+
+  for (const weekday of weekdayVariants) {
+    if (weekday.variants.some((variant) => t.includes(variant))) {
+      return weekday.index;
+    }
+  }
+
+  return -1;
+}
+
+function relativeDayFromText(text) {
+  const t = normalize(text);
+  if (t.includes("послезавтра")) {
+    return "day_after_tomorrow";
+  }
+  if (t.includes("завтра")) {
+    return "tomorrow";
+  }
+  if (t.includes("сегодня")) {
+    return "today";
+  }
+  return "";
+}
+
+function dayRequestFromText(text) {
+  const direct = relativeDayFromText(text);
+  if (direct) {
+    return { token: direct, unsupportedLabel: "" };
+  }
+
+  const targetWeekday = weekdayMatch(text);
+  if (targetWeekday < 0) {
+    return { token: "", unsupportedLabel: "" };
+  }
+
+  const now = new Date();
+  const todayWeekday = now.getDay();
+  const delta = (targetWeekday - todayWeekday + 7) % 7;
+  if (delta === 0) {
+    return { token: "today", unsupportedLabel: "" };
+  }
+  if (delta === 1) {
+    return { token: "tomorrow", unsupportedLabel: "" };
+  }
+  if (delta === 2) {
+    return { token: "day_after_tomorrow", unsupportedLabel: "" };
+  }
+
+  const targetDate = new Date(now);
+  targetDate.setDate(now.getDate() + delta);
+  return {
+    token: "",
+    unsupportedLabel: targetDate.toLocaleDateString("ru-RU", { weekday: "long", day: "numeric", month: "long" })
+  };
 }
 
 function timeWindowFromText(text) {
@@ -534,17 +663,7 @@ function exactTimeFromText(text) {
 }
 
 function dayFromText(text) {
-  const t = normalize(text);
-  if (t.includes("послезавтра")) {
-    return "day_after_tomorrow";
-  }
-  if (t.includes("завтра")) {
-    return "tomorrow";
-  }
-  if (t.includes("сегодня")) {
-    return "today";
-  }
-  return "";
+  return relativeDayFromText(text) || dayRequestFromText(text).token;
 }
 
 function extractDistrict(text) {
@@ -670,28 +789,101 @@ function isContactConfirmed(text) {
     t.includes("подтвержда") ||
     t.includes("подтвердить") ||
     t === "да" ||
+    t === "ага" ||
+    t === "угу" ||
+    t.includes("все верно") ||
+    t.includes("всё верно") ||
     t.includes("верно") ||
+    t.includes("да верно") ||
+    t.includes("да правильно") ||
     t.includes("правильно") ||
-    t.includes("подходит")
+    t.includes("подходит") ||
+    t.includes("соглас") ||
+    t.includes("ок") ||
+    t.includes("окей")
   );
 }
 
 function isContactCorrection(text) {
   const t = normalize(text);
-  return t.includes("неверно") || t.includes("ошибка") || t.includes("исправ") || t === "нет";
+  return (
+    t.includes("неверно") ||
+    t.includes("ошибка") ||
+    t.includes("исправ") ||
+    t.includes("не тот") ||
+    t.includes("не этот") ||
+    t === "нет" ||
+    t === "неа"
+  );
 }
 
-function isPositiveConfirmation(text) {
+function classifySlotConfirmationIntent(text) {
   const t = normalize(text);
-  return (
+  if (!t) {
+    return "unknown";
+  }
+
+  const startsNegative = /^(нет|неа)\b/.test(t);
+  const startsPositive = /^(да|ага|угу)\b/.test(t);
+  const hasNegative = isNegativeConfirmation(t);
+  const hasPositive =
     t === "да" ||
     t.includes("подходит") ||
     t.includes("удобно") ||
     t.includes("хорошо") ||
     t.includes("соглас") ||
     t.includes("берем") ||
-    t.includes("записывайте")
-  );
+    t.includes("записывайте");
+
+  if (startsNegative) {
+    return "negative";
+  }
+  if (startsPositive && hasNegative) {
+    return "ambiguous";
+  }
+  if (hasNegative && hasPositive) {
+    return "ambiguous";
+  }
+  if (hasNegative) {
+    return "negative";
+  }
+  if (startsPositive || hasPositive) {
+    return "positive";
+  }
+  return "unknown";
+}
+
+function classifyContactConfirmationIntent(text) {
+  const t = normalize(text);
+  if (!t) {
+    return "unknown";
+  }
+
+  const startsNegative = /^(нет|неа)\b/.test(t);
+  const startsPositive = /^(да|ага|угу)\b/.test(t);
+  const hasNegative = isContactCorrection(t);
+  const hasPositive = isContactConfirmed(t);
+
+  if (startsNegative) {
+    return "negative";
+  }
+  if (startsPositive && hasNegative) {
+    return "ambiguous";
+  }
+  if (hasNegative && hasPositive) {
+    return "ambiguous";
+  }
+  if (hasNegative) {
+    return "negative";
+  }
+  if (startsPositive || hasPositive) {
+    return "positive";
+  }
+  return "unknown";
+}
+
+function isPositiveConfirmation(text) {
+  return classifySlotConfirmationIntent(text) === "positive";
 }
 
 function isNegativeConfirmation(text) {
@@ -699,6 +891,7 @@ function isNegativeConfirmation(text) {
   return (
     t === "нет" ||
     t.includes("не подходит") ||
+    t.includes("не удоб") ||
     t.includes("неудобно") ||
     t.includes("другое время") ||
     t.includes("другой день") ||
@@ -790,42 +983,108 @@ function getUrgencyClarificationPrompt() {
   return "Уточню, пожалуйста: травма произошла сегодня, есть выраженный отек, деформация, кровотечение или невозможно наступить либо двигать конечностью?";
 }
 
-function inferProfileDecisionFromLocalSignals(symptoms) {
+function hasMusculoskeletalPainPattern(text) {
+  const normalized = normalize(text);
+  if (!normalized) {
+    return false;
+  }
+
+  const hasBodyPart = ORTHO_BODY_PART_CUE_FRAGMENTS.some((fragment) => normalized.includes(fragment));
+  const hasComplaint = ORTHO_COMPLAINT_CUE_FRAGMENTS.some((fragment) => normalized.includes(fragment));
+  return hasBodyPart && hasComplaint;
+}
+
+function inspectProfileSignals(symptoms) {
   const text = normalize(symptoms);
   if (!text) {
-    return "";
+    return {
+      normalizedSymptoms: "",
+      hasAcuteTraumaCue: false,
+      hasEmergencyCue: false,
+      hasPlannedCue: false,
+      hasMusculoskeletalPain: false,
+      heuristicSpecialty: "",
+      localDecision: ""
+    };
   }
 
   const hasAcuteTraumaCue = ACUTE_TRAUMA_CUE_FRAGMENTS.some((fragment) => text.includes(fragment));
   const hasEmergencyCue = EMERGENCY_TRAUMA_CUE_FRAGMENTS.some((fragment) => text.includes(fragment));
   const hasPlannedCue = PLANNED_ORTHO_CUE_FRAGMENTS.some((fragment) => text.includes(fragment));
+  const hasMusculoskeletalPain = hasMusculoskeletalPainPattern(text);
   const heuristicSpecialty = detectSpecialtyBySymptoms(text);
+  let localDecision = "";
 
   if (hasEmergencyCue && (hasAcuteTraumaCue || heuristicSpecialty)) {
-    return "Травмпункт";
+    localDecision = "Травмпункт";
+  } else if (
+    hasAcuteTraumaCue ||
+    hasPlannedCue ||
+    hasMusculoskeletalPain ||
+    heuristicSpecialty === "Травматолог-ортопед"
+  ) {
+    localDecision = "Травматолог-ортопед";
   }
 
-  if (hasAcuteTraumaCue || hasPlannedCue || heuristicSpecialty === "Травматолог-ортопед") {
-    return "Травматолог-ортопед";
+  return {
+    normalizedSymptoms: text,
+    hasAcuteTraumaCue,
+    hasEmergencyCue,
+    hasPlannedCue,
+    hasMusculoskeletalPain,
+    heuristicSpecialty,
+    localDecision
+  };
+}
+
+function inferProfileDecisionFromLocalSignals(symptoms) {
+  return inspectProfileSignals(symptoms).localDecision;
+}
+
+function getProfileSafetyTrace(symptoms, decision, turns = 0) {
+  const signals = inspectProfileSignals(symptoms);
+  const rawDecision = String(decision || "").trim();
+  let safeDecision = rawDecision;
+  let reason = "keep_model_decision";
+
+  if (!signals.localDecision) {
+    return {
+      rawDecision,
+      safeDecision,
+      reason: rawDecision ? "no_local_override_signal" : "empty_model_and_no_local_signal",
+      turns,
+      signals
+    };
   }
 
-  return "";
+  if (rawDecision === "NOT_PROFILE" || !rawDecision) {
+    if (shouldForceUrgencyClarification(symptoms, signals.localDecision, turns)) {
+      safeDecision = "NEED_INFO";
+      reason = "override_to_need_info_due_to_acute_trauma_without_urgency";
+    } else {
+      safeDecision = signals.localDecision;
+      reason = rawDecision === "NOT_PROFILE" ? "override_not_profile_by_local_signal" : "fill_empty_decision_by_local_signal";
+    }
+    return {
+      rawDecision,
+      safeDecision,
+      reason,
+      turns,
+      signals
+    };
+  }
+
+  return {
+    rawDecision,
+    safeDecision,
+    reason,
+    turns,
+    signals
+  };
 }
 
 function applyProfileSafetyOverride(symptoms, decision, turns = 0) {
-  const localDecision = inferProfileDecisionFromLocalSignals(symptoms);
-  if (!localDecision) {
-    return decision;
-  }
-
-  if (decision === "NOT_PROFILE" || !decision) {
-    if (shouldForceUrgencyClarification(symptoms, localDecision, turns)) {
-      return "NEED_INFO";
-    }
-    return localDecision;
-  }
-
-  return decision;
+  return getProfileSafetyTrace(symptoms, decision, turns).safeDecision;
 }
 
 function hasSymptomCue(text) {
@@ -871,6 +1130,10 @@ function detectSpecialtyBySymptoms(symptoms) {
       best = specialty;
       bestScore = score;
     }
+  }
+
+  if (!best && hasMusculoskeletalPainPattern(text)) {
+    return "Травматолог-ортопед";
   }
 
   return best;
@@ -926,27 +1189,39 @@ function slotDayRank(dayToken) {
   return 9;
 }
 
-function pickBooking() {
-  if (!state.specialty) {
-    return null;
+function buildCandidateBookings(options = {}) {
+  const specialty = options.specialty || state.specialty;
+  if (!specialty) {
+    return [];
   }
 
-  const candidates = clinics.filter((clinic) => clinic.doctors[state.specialty]);
+  const district = Object.prototype.hasOwnProperty.call(options, "district") ? options.district : state.district;
+  const preferredDay = Object.prototype.hasOwnProperty.call(options, "preferredDay")
+    ? options.preferredDay
+    : state.preferredDay;
+  const preferredWindow = Object.prototype.hasOwnProperty.call(options, "preferredWindow")
+    ? options.preferredWindow
+    : state.preferredWindow;
+  const preferredExactTime = Object.prototype.hasOwnProperty.call(options, "preferredExactTime")
+    ? options.preferredExactTime
+    : state.preferredExactTime;
+
+  const candidates = clinics.filter((clinic) => clinic.doctors[specialty]);
   if (!candidates.length) {
-    return null;
+    return [];
   }
 
-  const preferredExactMinutes = state.preferredExactTime ? slotTimeToMinutes(state.preferredExactTime) : -1;
+  const preferredExactMinutes = preferredExactTime ? slotTimeToMinutes(preferredExactTime) : -1;
   const candidateSlots = [];
 
   for (const clinic of candidates) {
-    const slots = clinic.doctors[state.specialty];
+    const slots = clinic.doctors[specialty];
     const futureSlots = slots.filter((slot) => slotIsStillAvailable(slot));
     for (const slot of futureSlots) {
-      if (state.preferredDay && slot.day !== state.preferredDay) {
+      if (preferredDay && slot.day !== preferredDay) {
         continue;
       }
-      if (state.preferredWindow && !slotMatchesWindow(slot.time, state.preferredWindow)) {
+      if (preferredWindow && !slotMatchesWindow(slot.time, preferredWindow)) {
         continue;
       }
 
@@ -954,7 +1229,7 @@ function pickBooking() {
         clinicName: clinic.name,
         district: clinic.district,
         address: clinic.address,
-        specialty: state.specialty,
+        specialty,
         day: slot.day,
         time: slot.time
       });
@@ -962,19 +1237,19 @@ function pickBooking() {
   }
 
   if (!candidateSlots.length) {
-    return null;
+    return [];
   }
 
   candidateSlots.sort((a, b) => {
-    const districtPenaltyA = state.district && a.district !== state.district ? 1 : 0;
-    const districtPenaltyB = state.district && b.district !== state.district ? 1 : 0;
+    const districtPenaltyA = district && a.district !== district ? 1 : 0;
+    const districtPenaltyB = district && b.district !== district ? 1 : 0;
     if (districtPenaltyA !== districtPenaltyB) {
       return districtPenaltyA - districtPenaltyB;
     }
 
     const dayRankA = slotDayRank(a.day);
     const dayRankB = slotDayRank(b.day);
-    if (!state.preferredDay && dayRankA !== dayRankB) {
+    if (!preferredDay && dayRankA !== dayRankB) {
       return dayRankA - dayRankB;
     }
 
@@ -1003,12 +1278,39 @@ function pickBooking() {
     return String(a.clinicName).localeCompare(String(b.clinicName), "ru");
   });
 
-  const chosen = candidateSlots[0] || null;
-  if (chosen) {
-    return chosen;
+  return candidateSlots;
+}
+
+function pickBooking() {
+  const candidates = buildCandidateBookings();
+  return candidates.length ? candidates[0] : null;
+}
+
+function isSlotInquiry(text) {
+  const t = normalize(text);
+  return (
+    t.includes("какие есть слот") ||
+    t.includes("какие слоты") ||
+    t.includes("какое свободное") ||
+    t.includes("что свободно") ||
+    t.includes("какое время есть") ||
+    t.includes("какое окно есть") ||
+    t.includes("что есть") ||
+    t.includes("свободные слоты") ||
+    t.includes("свободное время")
+  );
+}
+
+function formatAvailableSlotsReply(bookings, limit = 3) {
+  if (!bookings.length) {
+    return "";
   }
 
-  return null;
+  const top = bookings.slice(0, limit);
+  const slotsText = top
+    .map((slot) => `${dayLabelWithWeekday(slot.day)} в ${slot.time}, ${slot.clinicName}`)
+    .join("; ");
+  return `Могу предложить такие варианты: ${slotsText}. Какой вариант вам подходит?`;
 }
 
 function renderSummary() {
@@ -1820,7 +2122,7 @@ async function transcribeCapturedAudio(chunks, sessionId) {
     }
     const text = String(payload?.text || "").trim();
     if (text) {
-      handleConversation(text);
+      safeHandleConversation(text, "stt");
     }
   } catch (e) {
     if (!yandexSttFailureNotified) {
@@ -2053,7 +2355,7 @@ function findCurrentStepCueIndex(tokens, textNorm) {
 
   if (state.step === "collecting_time") {
     const hasTimeCue =
-      Boolean(dayFromText(textNorm) || timeWindowFromText(textNorm) || exactTimeFromText(textNorm)) ||
+      Boolean(dayFromText(textNorm) || timeWindowFromText(textNorm) || exactTimeFromText(textNorm) || weekdayMatch(textNorm) >= 0) ||
       textNorm.includes("любой") ||
       textNorm.includes("без разницы") ||
       textNorm.includes("не важно");
@@ -2202,7 +2504,7 @@ function scheduleRecognitionCommit(delayMs = USER_SPEECH_IDLE_MS) {
     recognitionLiveSnapshot = "";
 
     if (filteredText && !shouldDropAssistantEcho(filteredText)) {
-      handleConversation(filteredText);
+      safeHandleConversation(filteredText, "recognition_commit");
     }
   }, delayMs);
 }
@@ -2271,6 +2573,12 @@ function speakWithBrowser(text) {
       return;
     }
 
+    try {
+      window.speechSynthesis.cancel();
+    } catch (e) {
+      // ignore cancel race
+    }
+
     const utter = new SpeechSynthesisUtterance(text);
     utter.lang = "ru-RU";
     utter.rate = currentSpeechRate;
@@ -2322,20 +2630,69 @@ async function speakWithYandex(text) {
     await new Promise((resolve, reject) => {
       const audio = new Audio(audioUrl);
       activeAudio = audio;
-      audio.onended = () => resolve();
-      audio.onerror = () => reject(new Error("audio_playback_failed"));
-      audio.play().catch(reject);
+      let settled = false;
+      const timeoutId = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        try {
+          audio.pause();
+          audio.currentTime = 0;
+        } catch (e) {
+          // ignore
+        }
+        activeAudio = null;
+        reject(new Error("audio_playback_timeout"));
+      }, TTS_PLAYBACK_TIMEOUT_MS);
+
+      const cleanup = () => {
+        clearTimeout(timeoutId);
+        activeAudio = null;
+      };
+
+      audio.onended = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      audio.onerror = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        reject(new Error("audio_playback_failed"));
+      };
+      audio.play().catch((error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        reject(error);
+      });
     });
 
     yandexFailureNotified = false;
-    if (activeAudio) {
-      activeAudio = null;
-    }
     return true;
   } catch (e) {
     const errorText = String(e?.message || e || "");
     const recentCancel = Date.now() - playbackCancelledAt < 1800;
     const manualMicStop = Date.now() - manualMicStopAt < 1800;
+
+    if (activeAudio) {
+      try {
+        activeAudio.pause();
+        activeAudio.currentTime = 0;
+      } catch (pauseError) {
+        // ignore pause race
+      }
+      activeAudio = null;
+    }
 
     if (errorText.includes("audio_playback_failed") && (recentCancel || manualMicStop || !micActive)) {
       return true;
@@ -2347,7 +2704,7 @@ async function speakWithYandex(text) {
       console.warn(
         looksLikeAuthError
           ? "Yandex TTS auth error: проверьте YANDEX_API_KEY и YANDEX_FOLDER_ID"
-          : "Yandex TTS temporary error"
+          : `Yandex TTS temporary error: ${errorText || "unknown"}`
       );
       yandexFailureNotified = true;
     }
@@ -2364,7 +2721,59 @@ async function speak(text) {
   const prepared = prepareTextForSpeech(text);
   lastAssistantSpokenNorm = normalizeSpeechForCompare(prepared);
   lastAssistantSpokenAt = Date.now();
-  await speakWithYandex(prepared);
+  const yandexOk = await speakWithYandex(prepared);
+  if (!yandexOk) {
+    await speakWithBrowser(prepared);
+  }
+}
+
+async function reportClientLog(source, message) {
+  try {
+    await fetch("/api/client-log", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        source,
+        message
+      })
+    });
+  } catch (e) {
+    // ignore logging failure
+  }
+}
+
+async function reportClientIssue(source, error) {
+  const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error || "unknown_error");
+  console.error(`[${source}]`, error);
+  await reportClientLog(source, message);
+}
+
+async function reportTriageTrace(stage, symptoms, triage, trace) {
+  const message = [
+    `stage=${stage}`,
+    `raw=${trace.rawDecision || "<empty>"}`,
+    `local=${trace.signals.localDecision || "<empty>"}`,
+    `safe=${trace.safeDecision || "<empty>"}`,
+    `reason=${trace.reason}`,
+    `turns=${trace.turns}`,
+    `acute=${trace.signals.hasAcuteTraumaCue ? 1 : 0}`,
+    `emergency=${trace.signals.hasEmergencyCue ? 1 : 0}`,
+    `planned=${trace.signals.hasPlannedCue ? 1 : 0}`,
+    `mskPain=${trace.signals.hasMusculoskeletalPain ? 1 : 0}`,
+    `heuristic=${trace.signals.heuristicSpecialty || "<empty>"}`,
+    `question=${JSON.stringify(String(triage?.question || ""))}`,
+    `symptoms=${JSON.stringify(String(symptoms || "").slice(0, 240))}`
+  ].join(" ");
+  await reportClientLog("triage", message);
+}
+
+function safeHandleConversation(text, source = "conversation") {
+  void handleConversation(text).catch(async (error) => {
+    await reportClientIssue(source, error);
+    assistantReply("Внутренняя ошибка диалога. Скажите, пожалуйста, фразу еще раз.");
+  });
 }
 
 function assistantReply(text) {
@@ -2438,7 +2847,9 @@ async function handleConversation(text) {
   const possibleName = extractName(clean, { allowSingleWord: canUseSingleWordName });
   const possibleFullName = extractPatientFullName(clean);
   const district = extractDistrict(clean);
-  const day = dayFromText(clean);
+  const dayRequest = dayRequestFromText(clean);
+  const day = dayRequest.token;
+  const unsupportedDayLabel = dayRequest.unsupportedLabel;
   const windowToken = timeWindowFromText(clean);
   const exactTime = exactTimeFromText(clean);
   const noPreference =
@@ -2470,6 +2881,8 @@ async function handleConversation(text) {
 
   if (resolvedDay) {
     state.preferredDay = resolvedDay;
+  } else if (unsupportedDayLabel) {
+    state.preferredDay = "";
   }
 
   if (exactTime) {
@@ -2518,7 +2931,9 @@ async function handleConversation(text) {
     state.triageTurns = 0;
 
     const triage = await triageRouteAi(clean, "", 0);
-    const safeDecision = applyProfileSafetyOverride(clean, triage.decision, 0);
+    const triageTrace = getProfileSafetyTrace(clean, triage.decision, 0);
+    await reportTriageTrace("initial", clean, triage, triageTrace);
+    const safeDecision = triageTrace.safeDecision;
     if (!safeDecision) {
       assistantReply("Не удалось определить профиль врача. Повторите жалобу, пожалуйста.");
       renderSummary();
@@ -2551,7 +2966,9 @@ async function handleConversation(text) {
     state.urgencyNotes = state.urgencyNotes ? `${state.urgencyNotes}. ${clean}` : clean;
     const triage = await triageRouteAi(state.pendingSymptoms, state.urgencyNotes, state.triageTurns);
     const triageText = `${state.pendingSymptoms} ${state.urgencyNotes}`.trim();
-    const safeDecision = applyProfileSafetyOverride(triageText, triage.decision, state.triageTurns);
+    const triageTrace = getProfileSafetyTrace(triageText, triage.decision, state.triageTurns);
+    await reportTriageTrace("clarifying_urgency", triageText, triage, triageTrace);
+    const safeDecision = triageTrace.safeDecision;
 
     if (!safeDecision) {
       assistantReply("Не удалось уточнить срочность. Повторите, пожалуйста, есть ли выраженная деформация, кровотечение или невозможно наступить?");
@@ -2621,6 +3038,32 @@ async function handleConversation(text) {
   }
 
   if (state.step === "collecting_time") {
+    if (unsupportedDayLabel) {
+      const nearestOptions = buildCandidateBookings({
+        preferredDay: "",
+        preferredWindow: state.preferredWindow,
+        preferredExactTime: state.preferredExactTime
+      });
+      const fallbackText = nearestOptions.length
+        ? `На ${unsupportedDayLabel} в демо слоты пока не загружены. ${formatAvailableSlotsReply(nearestOptions)}`
+        : `На ${unsupportedDayLabel} в демо слоты пока не загружены. Могу предложить только ближайшие дни.`;
+      assistantReply(fallbackText);
+      renderSummary();
+      return;
+    }
+
+    if (isSlotInquiry(clean)) {
+      const available = buildCandidateBookings();
+      if (!available.length) {
+        assistantReply("По этим условиям свободных слотов нет. Могу посмотреть другой день или другое время.");
+        renderSummary();
+        return;
+      }
+      assistantReply(formatAvailableSlotsReply(available));
+      renderSummary();
+      return;
+    }
+
     if (!resolvedDay && !resolvedWindow && !noPreference) {
       assistantReply(dialogGuide?.reply || "Не расслышала время. Скажите: сегодня или завтра, и утро/день/вечер.");
       renderSummary();
@@ -2642,7 +3085,38 @@ async function handleConversation(text) {
   }
 
   if (state.step === "confirm_slot") {
-    if (isNegativeConfirmation(clean)) {
+    if (unsupportedDayLabel) {
+      state.booking = null;
+      state.step = "collecting_time";
+      const nearestOptions = buildCandidateBookings({
+        preferredDay: "",
+        preferredWindow: state.preferredWindow,
+        preferredExactTime: state.preferredExactTime
+      });
+      const fallbackText = nearestOptions.length
+        ? `На ${unsupportedDayLabel} слотов в демо нет. ${formatAvailableSlotsReply(nearestOptions)}`
+        : `На ${unsupportedDayLabel} слотов в демо нет. Назовите другой день, пожалуйста.`;
+      assistantReply(fallbackText);
+      renderSummary();
+      return;
+    }
+
+    if (isSlotInquiry(clean) || resolvedDay || resolvedWindow || exactTime) {
+      state.booking = null;
+      state.step = "collecting_time";
+      const available = buildCandidateBookings();
+      if (!available.length) {
+        assistantReply("По этим условиям свободных слотов нет. Назовите другой день или время.");
+        renderSummary();
+        return;
+      }
+      assistantReply(formatAvailableSlotsReply(available));
+      renderSummary();
+      return;
+    }
+
+    const slotConfirmationIntent = classifySlotConfirmationIntent(clean);
+    if (slotConfirmationIntent === "negative") {
       state.booking = null;
       state.step = "collecting_time";
       assistantReply("Хорошо. Назовите другой день или время: сегодня или завтра, утро/день/вечер.");
@@ -2650,15 +3124,21 @@ async function handleConversation(text) {
       return;
     }
 
-    if (!isPositiveConfirmation(clean)) {
-      assistantReply("Подскажите, пожалуйста, это время подходит? Можно ответить: «да» или «нет, другое время».");
+    if (slotConfirmationIntent === "ambiguous") {
+      assistantReply("Я не до конца поняла ответ. Это время подходит или подобрать другое? Можно сказать: «да, подходит» или «нет, другое время».");
+      renderSummary();
+      return;
+    }
+
+    if (slotConfirmationIntent !== "positive") {
+      assistantReply("Подскажите, пожалуйста, это время подходит? Можно ответить: «да, подходит» или «нет, другое время».");
       renderSummary();
       return;
     }
 
     const contactPrompt = state.patientName
-      ? `Нашла запись: ${state.booking.specialty}, клиника ${state.booking.clinicName} (${state.booking.address}), ${dayLabelForSpeech(state.booking.day)} в ${state.booking.time}. Продиктуйте номер телефона. После этого скажите «подтверждаю».`
-      : `Нашла запись: ${state.booking.specialty}, клиника ${state.booking.clinicName} (${state.booking.address}), ${dayLabelForSpeech(state.booking.day)} в ${state.booking.time}. Назовите имя пациента и номер телефона. После этого скажите «подтверждаю».`;
+      ? `Нашла запись: ${state.booking.specialty}, клиника ${state.booking.clinicName} (${state.booking.address}), ${dayLabelForSpeech(state.booking.day)} в ${state.booking.time}. Продиктуйте номер телефона. После этого можно просто сказать «да».`
+      : `Нашла запись: ${state.booking.specialty}, клиника ${state.booking.clinicName} (${state.booking.address}), ${dayLabelForSpeech(state.booking.day)} в ${state.booking.time}. Назовите имя пациента и номер телефона. После этого можно просто сказать «да».`;
     assistantReply(contactPrompt);
     state.step = "collecting_contact";
     renderSummary();
@@ -2670,7 +3150,7 @@ async function handleConversation(text) {
       state.pendingPhone = possiblePhone;
       state.step = "confirm_contact";
       assistantReply(
-        `Проверяю номер: ${state.pendingPhone}. Если все верно, скажите «подтверждаю». Если нужно исправить, продиктуйте номер еще раз.`
+        `Проверяю номер: ${state.pendingPhone}. Если все верно, скажите «да» или «подтверждаю». Если нужно исправить, продиктуйте номер еще раз.`
       );
       renderSummary();
       return;
@@ -2684,12 +3164,13 @@ async function handleConversation(text) {
   if (state.step === "confirm_contact") {
     if (possiblePhone) {
       state.pendingPhone = possiblePhone;
-      assistantReply(`Записала новый номер: ${state.pendingPhone}. Если верно, скажите «подтверждаю».`);
+      assistantReply(`Записала новый номер: ${state.pendingPhone}. Если верно, скажите «да» или «подтверждаю».`);
       renderSummary();
       return;
     }
 
-    if (isContactCorrection(clean)) {
+    const contactConfirmationIntent = classifyContactConfirmationIntent(clean);
+    if (contactConfirmationIntent === "negative") {
       state.pendingPhone = "";
       state.step = "collecting_contact";
       assistantReply("Хорошо, продиктуйте номер заново.");
@@ -2704,8 +3185,14 @@ async function handleConversation(text) {
       return;
     }
 
-    if (!isContactConfirmed(clean)) {
-      assistantReply("Скажите «подтверждаю» или продиктуйте номер еще раз.");
+    if (contactConfirmationIntent === "ambiguous") {
+      assistantReply("Я не до конца поняла. Номер верный или нужно исправить? Можно сказать: «да, номер верный» или продиктовать номер заново.");
+      renderSummary();
+      return;
+    }
+
+    if (contactConfirmationIntent !== "positive") {
+      assistantReply("Скажите «да, номер верный», «подтверждаю» или продиктуйте номер еще раз.");
       renderSummary();
       return;
     }
@@ -2725,7 +3212,9 @@ async function handleConversation(text) {
       state.triageTurns = 0;
 
       const triage = await triageRouteAi(clean, "", 0);
-      const safeDecision = applyProfileSafetyOverride(clean, triage.decision, 0);
+      const triageTrace = getProfileSafetyTrace(clean, triage.decision, 0);
+      await reportTriageTrace("after_done_restart", clean, triage, triageTrace);
+      const safeDecision = triageTrace.safeDecision;
       if (!safeDecision) {
         assistantReply("Не удалось определить профиль врача. Повторите жалобу, пожалуйста.");
         renderSummary();
@@ -2878,7 +3367,7 @@ function resetConversation(keepHistory = false, options = {}) {
 }
 
 sendBtn.addEventListener("click", () => {
-  handleConversation(textInput.value);
+  safeHandleConversation(textInput.value, "send_button");
   textInput.value = "";
   textInput.focus();
 });
@@ -2894,7 +3383,7 @@ resetBtn.addEventListener("click", () => resetConversation(true));
 
 chips.forEach((chip) => {
   chip.addEventListener("click", () => {
-    handleConversation(chip.dataset.text || "");
+    safeHandleConversation(chip.dataset.text || "", "chip");
   });
 });
 

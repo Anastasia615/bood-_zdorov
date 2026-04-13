@@ -146,6 +146,24 @@ function readBinaryBody(req, maxBytes = MAX_AUDIO_SIZE) {
   });
 }
 
+function handleClientLog(req, res) {
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "method_not_allowed" });
+    return;
+  }
+
+  readJsonBody(req)
+    .then((payload) => {
+      const source = String(payload?.source || "client").slice(0, 60);
+      const message = String(payload?.message || "").slice(0, 1000);
+      console.log(`[CLIENT:${source}] ${message}`);
+      sendJson(res, 200, { ok: true });
+    })
+    .catch((e) => {
+      sendJson(res, 400, { error: e.message || "bad_request" });
+    });
+}
+
 function clamp(num, min, max) {
   return Math.min(Math.max(num, min), max);
 }
@@ -189,6 +207,7 @@ async function handleTts(req, res) {
 
   const voice = String(payload.voice || "alena").toLowerCase();
   const speed = normalizeSpeed(payload.speed);
+  console.log(`[TTS] request voice=${voice} speed=${speed} text="${text.slice(0, 120)}"`);
 
   const body = new URLSearchParams({
     text: text.slice(0, 4500),
@@ -219,6 +238,7 @@ async function handleTts(req, res) {
 
   if (!yandexResponse.ok) {
     const details = await yandexResponse.text();
+    console.log(`[TTS] failed ${yandexResponse.status}: ${details.slice(0, 240)}`);
     sendJson(res, 502, {
       error: "yandex_tts_failed",
       status: yandexResponse.status,
@@ -228,6 +248,7 @@ async function handleTts(req, res) {
   }
 
   const audioBuffer = Buffer.from(await yandexResponse.arrayBuffer());
+  console.log(`[TTS] ok ${audioBuffer.length} bytes`);
   res.writeHead(200, {
     "Content-Type": "audio/mpeg",
     "Content-Length": String(audioBuffer.length),
@@ -523,6 +544,7 @@ async function handleDialogGuide(req, res) {
     sendJson(res, 400, { error: "user_message_required" });
     return;
   }
+  console.log(`[DIALOG] step=${String(payload.currentStep || "").trim() || "-"} user="${userMessage.slice(0, 160)}"`);
 
   const currentStep = String(payload.currentStep || "").trim();
   const dialogState = payload && typeof payload.state === "object" && payload.state ? payload.state : {};
@@ -614,6 +636,7 @@ async function handleDialogGuide(req, res) {
 
   if (!llmResponse.ok) {
     const details = await llmResponse.text();
+    console.log(`[DIALOG] failed ${llmResponse.status}: ${details.slice(0, 240)}`);
     sendJson(res, 502, {
       error: "yandex_gpt_failed",
       status: llmResponse.status,
@@ -649,6 +672,7 @@ async function handleDialogGuide(req, res) {
     patientName: String(extracted?.patientName || "").trim().slice(0, 120),
     understood: extracted?.understood !== false
   });
+  console.log(`[DIALOG] ok reply="${String(extracted?.reply || "").trim().slice(0, 180)}"`);
 }
 
 async function handleSpecialtyClassify(req, res) {
@@ -696,7 +720,7 @@ async function handleSpecialtyClassify(req, res) {
           "Выбери только один класс: Травматолог-ортопед, Травмпункт, NOT_PROFILE. " +
           "Экстренная травма направляется только в травмпункт на Сретенке. " +
           "Травмпункт выбирай только для срочных травм, сильного острого состояния, кровотечения, глубокой раны, подозрения на перелом или когда нужна неотложная помощь. " +
-          "Во всех остальных филиалах помощь оказывается планово, поэтому Травматолог-ортопед — любые неэкстренные травмы, боли в суставах, спине, связках и ортопедические жалобы. " +
+          "Во всех остальных филиалах помощь оказывается планово, поэтому Травматолог-ортопед — любые неэкстренные травмы, боли в суставах, спине, ноге, руке, колене, стопе, связках и другие ортопедические жалобы, даже если они возникли без явной травмы. " +
           "Если жалоба не относится к травматологии/ортопедии, верни NOT_PROFILE. " +
           "Ответ строго JSON без комментариев: {\"specialty\":\"...\",\"confidence\":0.0}"
       },
@@ -813,7 +837,7 @@ async function handleTriageRoute(req, res) {
           "Нужно выбрать только один результат: Травматолог-ортопед, Травмпункт, NOT_PROFILE, NEED_INFO. " +
           "Экстренная травма направляется только в травмпункт на Сретенке. " +
           "Травмпункт выбирай только если по описанию или уточнению похоже на срочную травму: подозрение на перелом, сильная деформация, кровотечение, глубокая или рваная рана, прокол, травма от штыря, арматуры или другого острого предмета, невозможно наступить или двигать конечностью, резкое тяжелое состояние после травмы. " +
-          "Травматолог-ортопед выбирай для плановой помощи: боли в спине, суставах, связках, ушибы и травмы без явных признаков срочности. " +
+          "Травматолог-ортопед выбирай для плановой помощи: боли в спине, ноге, руке, колене, стопе, суставах, связках, ушибы и травмы без явных признаков срочности, в том числе если боль возникла сама по себе без явной травмы. " +
           "Грубые, разговорные и жаргонные формулировки пациента все равно интерпретируй по медицинскому смыслу жалобы. " +
           "Если жалоба не относится к травматологии и ортопедии, верни NOT_PROFILE. " +
           "Если данных не хватает, верни NEED_INFO и задай один короткий вопрос только про срочность. " +
@@ -931,6 +955,11 @@ const server = http.createServer((req, res) => {
 
   if (parsed.pathname === "/api/dialog/guide") {
     handleDialogGuide(req, res);
+    return;
+  }
+
+  if (parsed.pathname === "/api/client-log") {
+    handleClientLog(req, res);
     return;
   }
 
