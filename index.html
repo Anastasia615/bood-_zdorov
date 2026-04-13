@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Будь здоров • Голосовой помощник</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&family=Unbounded:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="page-bg"></div>
+
+    <main class="phone-demo">
+      <button id="micBtn" class="call-button" type="button" aria-label="Запустить голосового помощника">
+        <span class="call-button-shell">
+          <span id="micBtnState" class="call-button-state">ГОТОВ</span>
+          <span id="micBtnLabel" class="call-button-label">НАЖМИТЕ,<br />ЧТОБЫ ПОЗВОНИТЬ</span>
+        </span>
+      </button>
+      <span id="statusBadge" class="sr-only">Микрофон выключен</span>
+    </main>
+
+    <section class="backstage" aria-hidden="true">
+      <div id="chat"></div>
+      <div id="summary"></div>
+      <div id="history"></div>
+
+      <div class="quick-phrases">
+        <button class="chip" data-text="Подвернул голеностоп после тренировки, больно наступать" type="button">Травма голеностопа</button>
+        <button class="chip" data-text="После падения болит плечо и есть отек" type="button">Ушиб плеча</button>
+        <button class="chip" data-text="Боль в коленном суставе при ходьбе, нужна консультация ортопеда" type="button">Колено и сустав</button>
+        <button class="chip" data-text="Болит горло и температура" type="button">Непрофильный пример</button>
+      </div>
+
+      <input id="textInput" type="text" />
+      <button id="sendBtn" type="button">Отправить</button>
+      <button id="resetBtn" type="button">Новая запись</button>
+      <select id="voiceSelect"></select>
+    </section>
+
+    <script src="app.js"></script>
+  </body>
+</html>

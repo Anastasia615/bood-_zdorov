@@ -1,0 +1,9 @@
+{
+  "name": "clinic-voice-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Voice demo for clinic routing with optional Yandex TTS",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
