@@ -56,11 +56,6 @@ const clinics = [
     district: "центр",
     address: "г. Москва, ул. Последний переулок, д. 28",
     doctors: {
-      "Травматолог-ортопед": [
-        { day: "today", time: "10:30" },
-        { day: "today", time: "17:30" },
-        { day: "tomorrow", time: "13:00" }
-      ],
       Травмпункт: [
         { day: "today", time: "09:00" },
         { day: "today", time: "12:00" },
