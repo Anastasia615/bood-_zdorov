@@ -1852,13 +1852,7 @@ function stopBargeInLoop() {
   bargeInNoiseFloor = 0.008;
 }
 
-function releaseBargeInResources() {
-  stopBargeInLoop();
-  cancelSttCapture(false);
-  sttRequestInFlight = false;
-  sttPreRollChunks = [];
-  sttPreRollFrames = 0;
-  bargeInResumePromise = null;
+function clearIosWakeLock() {
   if (iosWakeLockOscillator) {
     try {
       iosWakeLockOscillator.stop();
@@ -1880,6 +1874,16 @@ function releaseBargeInResources() {
     }
     iosWakeLockGain = null;
   }
+}
+
+function clearBargeInGraph(preserveSession = false) {
+  stopBargeInLoop();
+  cancelSttCapture(false);
+  sttRequestInFlight = false;
+  sttPreRollChunks = [];
+  sttPreRollFrames = 0;
+  bargeInResumePromise = null;
+  clearIosWakeLock();
   if (bargeInProcessor) {
     try {
       bargeInProcessor.disconnect();
@@ -1913,11 +1917,11 @@ function releaseBargeInResources() {
     }
     bargeInAnalyser = null;
   }
-  if (bargeInStream) {
+  if (!preserveSession && bargeInStream) {
     bargeInStream.getTracks().forEach((track) => track.stop());
     bargeInStream = null;
   }
-  if (bargeInAudioContext) {
+  if (!preserveSession && bargeInAudioContext) {
     try {
       bargeInAudioContext.close();
     } catch (e) {
@@ -1926,6 +1930,10 @@ function releaseBargeInResources() {
     bargeInAudioContext = null;
   }
   bargeInData = null;
+}
+
+function releaseBargeInResources() {
+  clearBargeInGraph(false);
 }
 
 function hasLiveBargeInTrack() {
@@ -1956,38 +1964,16 @@ async function resumeBargeInAudioContext() {
   return bargeInResumePromise;
 }
 
-async function ensureBargeInMonitor() {
-  if (bargeInAnalyser && bargeInData && bargeInAudioContext && hasLiveBargeInTrack()) {
-    const resumed = await resumeBargeInAudioContext();
-    if (resumed) {
-      return true;
-    }
-  }
-
-  if (bargeInAudioContext || bargeInStream) {
-    releaseBargeInResources();
-  }
-
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+async function attachBargeInGraph() {
+  if (!bargeInAudioContext || !bargeInStream || !hasLiveBargeInTrack()) {
     return false;
   }
 
   try {
-    bargeInStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      }
-    });
-
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) {
+    const resumed = await resumeBargeInAudioContext();
+    if (!resumed) {
       return false;
     }
-
-    bargeInAudioContext = new Ctx();
-    await resumeBargeInAudioContext();
     bargeInSource = bargeInAudioContext.createMediaStreamSource(bargeInStream);
     bargeInAnalyser = bargeInAudioContext.createAnalyser();
     bargeInAnalyser.fftSize = 1024;
@@ -2025,6 +2011,56 @@ async function ensureBargeInMonitor() {
     }
     return true;
   } catch (e) {
+    return false;
+  }
+}
+
+async function ensureBargeInMonitor() {
+  if (bargeInAnalyser && bargeInData && bargeInAudioContext && hasLiveBargeInTrack()) {
+    const resumed = await resumeBargeInAudioContext();
+    if (resumed) {
+      return true;
+    }
+  }
+
+  if (bargeInAudioContext && bargeInStream && hasLiveBargeInTrack()) {
+    clearBargeInGraph(true);
+    const rebound = await attachBargeInGraph();
+    if (rebound) {
+      return true;
+    }
+  }
+
+  if (bargeInAudioContext || bargeInStream) {
+    releaseBargeInResources();
+  }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    return false;
+  }
+
+  try {
+    bargeInStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    });
+
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) {
+      return false;
+    }
+
+    bargeInAudioContext = new Ctx();
+    const attached = await attachBargeInGraph();
+    if (attached) {
+      return true;
+    }
+    releaseBargeInResources();
+    return false;
+  } catch (e) {
     releaseBargeInResources();
     return false;
   }
@@ -2043,9 +2079,17 @@ async function rebuildListeningPipelineAfterSpeech() {
     return false;
   }
 
-  if (isIosSafari()) {
-    releaseBargeInResources();
+  if (isIosSafari() && bargeInAudioContext && bargeInStream && hasLiveBargeInTrack()) {
+    clearBargeInGraph(true);
     await wait(IOS_SAFARI_AUDIO_REBUILD_DELAY_MS);
+    const ok = await attachBargeInGraph();
+    if (ok && micActive) {
+      startBargeInLoop();
+    }
+    return ok;
+  }
+
+  if (isIosSafari()) {
     return ensureListeningPipelineReady();
   }
 
@@ -2249,7 +2293,7 @@ function interruptAssistantForBargeIn() {
     }
     activeAudio = null;
   }
-  endAssistantSpeech();
+  void endAssistantSpeech(false);
   beginSttCapture(false);
 }
 
@@ -2642,13 +2686,22 @@ function scheduleRecognitionRestart(delayMs = 0) {
   }, delayMs);
 }
 
-function endAssistantSpeech() {
+async function endAssistantSpeech(awaitListeningPipeline = false) {
   isSpeaking = false;
   assistantSpeechReleasedAt = Date.now();
   sttSpeechMs = 0;
   sttSilenceMs = 0;
+  const listeningPipelinePromise = micActive ? rebuildListeningPipelineAfterSpeech() : Promise.resolve(false);
   if (micActive) {
-    void rebuildListeningPipelineAfterSpeech();
+    if (awaitListeningPipeline) {
+      try {
+        await listeningPipelinePromise;
+      } catch (e) {
+        // ignore rebuild errors here
+      }
+    } else {
+      void listeningPipelinePromise.catch(() => {});
+    }
   }
   if (STOP_RECOGNITION_DURING_ASSISTANT_SPEECH && micActive && shouldResumeListeningAfterSpeech && recognition) {
     shouldResumeListeningAfterSpeech = false;
@@ -2800,7 +2853,7 @@ async function speakWithYandex(text) {
     if (audioUrl) {
       URL.revokeObjectURL(audioUrl);
     }
-    endAssistantSpeech();
+    await endAssistantSpeech(true);
   }
 }
 
