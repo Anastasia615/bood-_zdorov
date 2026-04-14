@@ -257,6 +257,7 @@ let bargeInRafId = 0;
 let bargeInLastTs = 0;
 let bargeInSpeechMs = 0;
 let bargeInNoiseFloor = 0.008;
+let bargeInResumePromise = null;
 let micInputSampleRate = 16000;
 let sttCaptureActive = false;
 let sttCaptureStartedAt = 0;
@@ -1937,6 +1938,7 @@ function releaseBargeInResources() {
   sttRequestInFlight = false;
   sttPreRollChunks = [];
   sttPreRollFrames = 0;
+  bargeInResumePromise = null;
   if (bargeInProcessor) {
     try {
       bargeInProcessor.disconnect();
@@ -1985,9 +1987,44 @@ function releaseBargeInResources() {
   bargeInData = null;
 }
 
-async function ensureBargeInMonitor() {
-  if (bargeInAnalyser && bargeInData) {
+function hasLiveBargeInTrack() {
+  return Boolean(
+    bargeInStream?.getAudioTracks?.().some((track) => track.readyState === "live")
+  );
+}
+
+async function resumeBargeInAudioContext() {
+  if (!bargeInAudioContext) {
+    return false;
+  }
+
+  if (bargeInAudioContext.state === "running") {
     return true;
+  }
+
+  if (!bargeInResumePromise) {
+    bargeInResumePromise = bargeInAudioContext
+      .resume()
+      .then(() => bargeInAudioContext.state === "running")
+      .catch(() => false)
+      .finally(() => {
+        bargeInResumePromise = null;
+      });
+  }
+
+  return bargeInResumePromise;
+}
+
+async function ensureBargeInMonitor() {
+  if (bargeInAnalyser && bargeInData && bargeInAudioContext && hasLiveBargeInTrack()) {
+    const resumed = await resumeBargeInAudioContext();
+    if (resumed) {
+      return true;
+    }
+  }
+
+  if (bargeInAudioContext || bargeInStream) {
+    releaseBargeInResources();
   }
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -2009,9 +2046,7 @@ async function ensureBargeInMonitor() {
     }
 
     bargeInAudioContext = new Ctx();
-    if (bargeInAudioContext.state === "suspended") {
-      await bargeInAudioContext.resume();
-    }
+    await resumeBargeInAudioContext();
     bargeInSource = bargeInAudioContext.createMediaStreamSource(bargeInStream);
     bargeInAnalyser = bargeInAudioContext.createAnalyser();
     bargeInAnalyser.fftSize = 1024;
@@ -2039,6 +2074,14 @@ async function ensureBargeInMonitor() {
     releaseBargeInResources();
     return false;
   }
+}
+
+async function ensureListeningPipelineReady() {
+  const ok = await ensureBargeInMonitor();
+  if (ok && micActive) {
+    startBargeInLoop();
+  }
+  return ok;
 }
 
 function pushPreRollChunk(chunk) {
@@ -2628,6 +2671,9 @@ function endAssistantSpeech() {
   assistantSpeechReleasedAt = Date.now();
   sttSpeechMs = 0;
   sttSilenceMs = 0;
+  if (micActive) {
+    void ensureListeningPipelineReady();
+  }
   if (STOP_RECOGNITION_DURING_ASSISTANT_SPEECH && micActive && shouldResumeListeningAfterSpeech && recognition) {
     shouldResumeListeningAfterSpeech = false;
     scheduleRecognitionRestart(RECOGNITION_RESUME_DELAY_MS);
@@ -3409,10 +3455,10 @@ function toggleMic() {
     micActive = true;
     setMicState(true);
     clearSpeech();
-    ensureBargeInMonitor()
+    ensureListeningPipelineReady()
       .then((ok) => {
         if (ok && micActive) {
-          startBargeInLoop();
+          assistantReply(getWelcomePrompt());
         } else if (!ok) {
           micActive = false;
           setMicState(false);
@@ -3424,7 +3470,6 @@ function toggleMic() {
         setMicState(false);
         assistantReply("Микрофон недоступен. Проверьте разрешение браузера на доступ к микрофону.");
       });
-    assistantReply(getWelcomePrompt());
     return;
   }
 
