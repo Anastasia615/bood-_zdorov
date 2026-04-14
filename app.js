@@ -227,6 +227,8 @@ let yandexTtsConfigured = false;
 let currentTtsProvider = "yandex";
 let currentYandexVoice = "marina";
 let aiClassifierFallbackNotified = false;
+const triageCache = new Map();
+const specialtyAiCache = new Map();
 let recognitionStableText = "";
 let recognitionLiveTail = "";
 let recognitionLiveSnapshot = "";
@@ -287,7 +289,17 @@ const STT_TARGET_SAMPLE_RATE = 16000;
 const STT_CONTINUE_MIN_RMS_THRESHOLD = 0.018;
 const STT_CONTINUE_RMS_MULTIPLIER = 1.9;
 const STT_MIN_CAPTURE_BEFORE_SILENCE_MS = 280;
-const TTS_PLAYBACK_TIMEOUT_MS = 15000;
+const TTS_PLAYBACK_START_TIMEOUT_MS = 5000;
+const REQUEST_TIMEOUT_MS = Object.freeze({
+  ttsHealth: 2500,
+  specialtyClassify: 4500,
+  triageRoute: 5000,
+  dialogGuide: 4000,
+  stt: 12000,
+  tts: 12000,
+  clientLog: 1200
+});
+const CLIENT_SIDE_CACHE_LIMIT = 48;
 const LOW_SIGNAL_UTTERANCES = new Set([
   "вот",
   "ну",
@@ -1139,6 +1151,11 @@ function detectSpecialtyBySymptoms(symptoms) {
   return best;
 }
 
+function getLocalTriageFallbackDecision(symptoms, extra = "") {
+  const combined = `${String(symptoms || "").trim()} ${String(extra || "").trim()}`.trim();
+  return inferProfileDecisionFromLocalSignals(combined) || detectSpecialtyBySymptoms(combined);
+}
+
 function slotMatchesWindow(slotTime, windowToken) {
   if (!windowToken) {
     return true;
@@ -1421,6 +1438,42 @@ function prepareTextForSpeech(text) {
   return out.replace(/\s*•\s*/g, ". ").trim();
 }
 
+function buildCacheKey(...parts) {
+  return parts.map((part) => normalize(String(part || ""))).join(" | ");
+}
+
+function rememberCachedValue(cache, key, value, maxSize = CLIENT_SIDE_CACHE_LIMIT) {
+  cache.set(key, value);
+  if (cache.size <= maxSize) {
+    return value;
+  }
+
+  const oldestKey = cache.keys().next().value;
+  if (oldestKey !== undefined) {
+    cache.delete(oldestKey);
+  }
+  return value;
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error("fetch_timeout");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 function updateRateLabel() {
   if (speechRateValue) {
     speechRateValue.textContent = `${currentSpeechRate.toFixed(2)}x`;
@@ -1495,7 +1548,7 @@ function syncVoiceSelectByProvider() {
 
 async function checkYandexTtsHealth() {
   try {
-    const res = await fetch("/api/tts/health", { cache: "no-store" });
+    const res = await fetchWithTimeout("/api/tts/health", { cache: "no-store" }, REQUEST_TIMEOUT_MS.ttsHealth);
     if (!res.ok) {
       throw new Error("health check failed");
     }
@@ -1512,14 +1565,23 @@ async function detectSpecialtyBySymptomsAi(symptoms) {
     return "";
   }
 
+  const cacheKey = buildCacheKey(text);
+  if (specialtyAiCache.has(cacheKey)) {
+    return specialtyAiCache.get(cacheKey);
+  }
+
   try {
-    const res = await fetch("/api/specialty/classify", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
+    const res = await fetchWithTimeout(
+      "/api/specialty/classify",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ text })
       },
-      body: JSON.stringify({ text })
-    });
+      REQUEST_TIMEOUT_MS.specialtyClassify
+    );
 
     if (!res.ok) {
       let details = {};
@@ -1537,7 +1599,7 @@ async function detectSpecialtyBySymptomsAi(symptoms) {
             "Нейросетевая классификация YandexGPT сейчас недоступна по правам доступа. Временно использую резервный режим маршрутизации."
           );
         }
-        return fallbackSpecialty;
+        return rememberCachedValue(specialtyAiCache, cacheKey, fallbackSpecialty);
       }
 
       throw new Error(`specialty_classify_${res.status}`);
@@ -1546,9 +1608,9 @@ async function detectSpecialtyBySymptomsAi(symptoms) {
     const payload = await res.json();
     const specialty = String(payload?.specialty || "").trim();
     if (specialty === "Травматолог-ортопед" || specialty === "Травмпункт") {
-      return specialty;
+      return rememberCachedValue(specialtyAiCache, cacheKey, specialty);
     }
-    return detectSpecialtyBySymptoms(text);
+    return rememberCachedValue(specialtyAiCache, cacheKey, detectSpecialtyBySymptoms(text));
   } catch (e) {
     console.warn("Specialty classification failed:", e?.message || e);
     const fallbackSpecialty = detectSpecialtyBySymptoms(text);
@@ -1561,7 +1623,7 @@ async function detectSpecialtyBySymptomsAi(symptoms) {
         "Нейросетевая классификация YandexGPT сейчас недоступна. Временно использую резервный режим маршрутизации."
       );
     }
-    return fallbackSpecialty;
+    return rememberCachedValue(specialtyAiCache, cacheKey, fallbackSpecialty);
   }
 }
 
@@ -1572,49 +1634,47 @@ async function triageRouteAi(symptoms, extra = "", turns = 0) {
     return { decision: "", question: "" };
   }
 
+  const cacheKey = buildCacheKey(baseSymptoms, extraInfo, turns);
+  if (triageCache.has(cacheKey)) {
+    return triageCache.get(cacheKey);
+  }
+
   try {
-    const res = await fetch("/api/triage/route", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
+    const res = await fetchWithTimeout(
+      "/api/triage/route",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          symptoms: baseSymptoms,
+          extra: extraInfo,
+          turns
+        })
       },
-      body: JSON.stringify({
-        symptoms: baseSymptoms,
-        extra: extraInfo,
-        turns
-      })
-    });
+      REQUEST_TIMEOUT_MS.triageRoute
+    );
 
     if (!res.ok) {
-      let details = {};
-      try {
-        details = await res.json();
-      } catch (e) {
-        // ignore
-      }
-
-      const fallbackSpecialty = await detectSpecialtyBySymptomsAi(`${baseSymptoms} ${extraInfo}`.trim());
-      if (fallbackSpecialty) {
-        return { decision: fallbackSpecialty, question: "" };
-      }
-      if (details?.error === "yandex_gpt_failed" || res.status === 403) {
-        return { decision: "", question: "" };
-      }
-      throw new Error(`triage_route_${res.status}`);
+      const fallbackResult = {
+        decision: getLocalTriageFallbackDecision(baseSymptoms, extraInfo),
+        question: ""
+      };
+      return rememberCachedValue(triageCache, cacheKey, fallbackResult);
     }
 
     const payload = await res.json();
-    return {
+    return rememberCachedValue(triageCache, cacheKey, {
       decision: String(payload?.decision || "").trim(),
       question: String(payload?.question || "").trim()
-    };
+    });
   } catch (e) {
     console.warn("Triage route failed:", e?.message || e);
-    const fallbackSpecialty = await detectSpecialtyBySymptomsAi(`${baseSymptoms} ${extraInfo}`.trim());
-    return {
-      decision: fallbackSpecialty,
+    return rememberCachedValue(triageCache, cacheKey, {
+      decision: getLocalTriageFallbackDecision(baseSymptoms, extraInfo),
       question: ""
-    };
+    });
   }
 }
 
@@ -1758,19 +1818,23 @@ async function guideDialogAi(userMessage) {
   }
 
   try {
-    const res = await fetch("/api/dialog/guide", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
+    const res = await fetchWithTimeout(
+      "/api/dialog/guide",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          userMessage: text,
+          currentStep: state.step,
+          state: getDialogStateSnapshot(),
+          history: dialogHistory.slice(-8),
+          clinics: getDialogClinicCatalog()
+        })
       },
-      body: JSON.stringify({
-        userMessage: text,
-        currentStep: state.step,
-        state: getDialogStateSnapshot(),
-        history: dialogHistory.slice(-8),
-        clinics: getDialogClinicCatalog()
-      })
-    });
+      REQUEST_TIMEOUT_MS.dialogGuide
+    );
 
     if (!res.ok) {
       return null;
@@ -2088,13 +2152,17 @@ async function transcribeCapturedAudio(chunks, sessionId) {
 
   sttRequestInFlight = true;
   try {
-    const response = await fetch(`/api/stt?sampleRate=${STT_TARGET_SAMPLE_RATE}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/octet-stream"
+    const response = await fetchWithTimeout(
+      `/api/stt?sampleRate=${STT_TARGET_SAMPLE_RATE}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/octet-stream"
+        },
+        body: encodePcm16(resampled)
       },
-      body: encodePcm16(resampled)
-    });
+      REQUEST_TIMEOUT_MS.stt
+    );
 
     if (!response.ok) {
       let details = {};
@@ -2642,17 +2710,21 @@ async function speakWithYandex(text) {
   let audioUrl = "";
   beginAssistantSpeech();
   try {
-    const response = await fetch("/api/tts", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
+    const response = await fetchWithTimeout(
+      "/api/tts",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          text,
+          voice: currentYandexVoice,
+          speed: currentSpeechRate
+        })
       },
-      body: JSON.stringify({
-        text,
-        voice: currentYandexVoice,
-        speed: currentSpeechRate
-      })
-    });
+      REQUEST_TIMEOUT_MS.tts
+    );
 
     if (!response.ok) {
       throw new Error(`yandex_tts_${response.status}`);
@@ -2665,20 +2737,26 @@ async function speakWithYandex(text) {
       const audio = new Audio(audioUrl);
       activeAudio = audio;
       let settled = false;
+      let playbackStarted = false;
       const timeoutId = setTimeout(() => {
-        if (settled) {
+        if (settled || playbackStarted) {
           return;
         }
         settled = true;
         stopActiveAudioPlayback();
-        reject(new Error("audio_playback_timeout"));
-      }, TTS_PLAYBACK_TIMEOUT_MS);
+        reject(new Error("audio_playback_start_timeout"));
+      }, TTS_PLAYBACK_START_TIMEOUT_MS);
 
       const cleanup = () => {
         clearTimeout(timeoutId);
         if (activeAudio === audio) {
           activeAudio = null;
         }
+      };
+
+      const markPlaybackStarted = () => {
+        playbackStarted = true;
+        clearTimeout(timeoutId);
       };
 
       audio.onended = () => {
@@ -2697,6 +2775,8 @@ async function speakWithYandex(text) {
         cleanup();
         reject(new Error("audio_playback_failed"));
       };
+      audio.onplaying = markPlaybackStarted;
+      audio.oncanplay = markPlaybackStarted;
       audio.play().catch((error) => {
         if (settled) {
           return;
@@ -2746,34 +2826,39 @@ async function speak(text) {
   const yandexOk = await speakWithYandex(prepared);
   if (!yandexOk) {
     stopActiveAudioPlayback();
-    await reportClientLog("tts", "Yandex TTS unavailable; browser fallback disabled");
+    void reportClientLog("tts", "Yandex TTS unavailable; browser fallback disabled");
   }
 }
 
 async function reportClientLog(source, message) {
   try {
-    await fetch("/api/client-log", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
+    await fetchWithTimeout(
+      "/api/client-log",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        keepalive: true,
+        body: JSON.stringify({
+          source,
+          message
+        })
       },
-      body: JSON.stringify({
-        source,
-        message
-      })
-    });
+      REQUEST_TIMEOUT_MS.clientLog
+    );
   } catch (e) {
     // ignore logging failure
   }
 }
 
-async function reportClientIssue(source, error) {
+function reportClientIssue(source, error) {
   const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error || "unknown_error");
   console.error(`[${source}]`, error);
-  await reportClientLog(source, message);
+  return reportClientLog(source, message);
 }
 
-async function reportTriageTrace(stage, symptoms, triage, trace) {
+function reportTriageTrace(stage, symptoms, triage, trace) {
   const message = [
     `stage=${stage}`,
     `raw=${trace.rawDecision || "<empty>"}`,
@@ -2789,12 +2874,12 @@ async function reportTriageTrace(stage, symptoms, triage, trace) {
     `question=${JSON.stringify(String(triage?.question || ""))}`,
     `symptoms=${JSON.stringify(String(symptoms || "").slice(0, 240))}`
   ].join(" ");
-  await reportClientLog("triage", message);
+  return reportClientLog("triage", message);
 }
 
 function safeHandleConversation(text, source = "conversation") {
-  void handleConversation(text).catch(async (error) => {
-    await reportClientIssue(source, error);
+  void handleConversation(text).catch((error) => {
+    void reportClientIssue(source, error);
     assistantReply("Внутренняя ошибка диалога. Скажите, пожалуйста, фразу еще раз.");
   });
 }
@@ -2955,7 +3040,7 @@ async function handleConversation(text) {
 
     const triage = await triageRouteAi(clean, "", 0);
     const triageTrace = getProfileSafetyTrace(clean, triage.decision, 0);
-    await reportTriageTrace("initial", clean, triage, triageTrace);
+    void reportTriageTrace("initial", clean, triage, triageTrace);
     const safeDecision = triageTrace.safeDecision;
     if (!safeDecision) {
       assistantReply("Не удалось определить профиль врача. Повторите жалобу, пожалуйста.");
@@ -2990,7 +3075,7 @@ async function handleConversation(text) {
     const triage = await triageRouteAi(state.pendingSymptoms, state.urgencyNotes, state.triageTurns);
     const triageText = `${state.pendingSymptoms} ${state.urgencyNotes}`.trim();
     const triageTrace = getProfileSafetyTrace(triageText, triage.decision, state.triageTurns);
-    await reportTriageTrace("clarifying_urgency", triageText, triage, triageTrace);
+    void reportTriageTrace("clarifying_urgency", triageText, triage, triageTrace);
     const safeDecision = triageTrace.safeDecision;
 
     if (!safeDecision) {
@@ -3236,7 +3321,7 @@ async function handleConversation(text) {
 
       const triage = await triageRouteAi(clean, "", 0);
       const triageTrace = getProfileSafetyTrace(clean, triage.decision, 0);
-      await reportTriageTrace("after_done_restart", clean, triage, triageTrace);
+      void reportTriageTrace("after_done_restart", clean, triage, triageTrace);
       const safeDecision = triageTrace.safeDecision;
       if (!safeDecision) {
         assistantReply("Не удалось определить профиль врача. Повторите жалобу, пожалуйста.");
