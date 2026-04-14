@@ -13,6 +13,8 @@ const ttsProviderSelect = document.getElementById("ttsProvider");
 const voiceSelect = document.getElementById("voiceSelect");
 const speechRateInput = document.getElementById("speechRate");
 const speechRateValue = document.getElementById("speechRateValue");
+const IOS_WEBKIT_RE = /iP(hone|ad|od)/i;
+const NON_SAFARI_IOS_RE = /CriOS|FxiOS|EdgiOS|OPiOS/i;
 
 const clinics = [
   {
@@ -1434,6 +1436,11 @@ function prepareTextForSpeech(text) {
   return out.replace(/\s*•\s*/g, ". ").trim();
 }
 
+function isIosSafari() {
+  const ua = String(navigator.userAgent || "");
+  return IOS_WEBKIT_RE.test(ua) && /WebKit/i.test(ua) && !NON_SAFARI_IOS_RE.test(ua);
+}
+
 function buildCacheKey(...parts) {
   return parts.map((part) => normalize(String(part || ""))).join(" | ");
 }
@@ -2079,6 +2086,22 @@ async function ensureListeningPipelineReady() {
   return ok;
 }
 
+async function rebuildListeningPipelineAfterSpeech() {
+  if (!micActive) {
+    return false;
+  }
+
+  if (isIosSafari() && bargeInAudioContext) {
+    const resumed = await resumeBargeInAudioContext();
+    if (resumed && hasLiveBargeInTrack() && bargeInAnalyser && bargeInData) {
+      startBargeInLoop();
+      return true;
+    }
+  }
+
+  return ensureListeningPipelineReady();
+}
+
 function pushPreRollChunk(chunk) {
   if (!chunk?.length) {
     return;
@@ -2282,6 +2305,9 @@ function startBargeInLoop() {
 
   const tick = (ts) => {
     bargeInRafId = requestAnimationFrame(tick);
+    if (micActive && !isSpeaking && isIosSafari() && bargeInAudioContext?.state === "suspended") {
+      void resumeBargeInAudioContext().catch(() => {});
+    }
     if (!micActive || !bargeInAnalyser || !bargeInData) {
       bargeInSpeechMs = 0;
       return;
@@ -2667,7 +2693,7 @@ function endAssistantSpeech() {
   sttSpeechMs = 0;
   sttSilenceMs = 0;
   if (micActive) {
-    void ensureListeningPipelineReady();
+    void rebuildListeningPipelineAfterSpeech();
   }
   if (STOP_RECOGNITION_DURING_ASSISTANT_SPEECH && micActive && shouldResumeListeningAfterSpeech && recognition) {
     shouldResumeListeningAfterSpeech = false;
@@ -2776,6 +2802,9 @@ async function speakWithYandex(text) {
 
     await new Promise((resolve, reject) => {
       const audio = new Audio(audioUrl);
+      audio.preload = "auto";
+      audio.playsInline = true;
+      audio.setAttribute("playsinline", "");
       activeAudio = audio;
       let settled = false;
       let playbackStarted = false;
