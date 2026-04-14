@@ -9,7 +9,6 @@ const statusBadge = document.getElementById("statusBadge");
 const micBtnState = document.getElementById("micBtnState");
 const micBtnLabel = document.getElementById("micBtnLabel");
 const chips = Array.from(document.querySelectorAll(".chip"));
-const ttsProviderSelect = document.getElementById("ttsProvider");
 const voiceSelect = document.getElementById("voiceSelect");
 const speechRateInput = document.getElementById("speechRate");
 const speechRateValue = document.getElementById("speechRateValue");
@@ -214,14 +213,11 @@ let micActive = false;
 let isSpeaking = false;
 let suppressRecognitionRestart = false;
 let shouldResumeListeningAfterSpeech = false;
-let selectedVoice = null;
-let selectedVoiceName = "";
 let speechQueue = Promise.resolve();
 const currentSpeechRate = 1.04;
 let activeAudio = null;
 let yandexFailureNotified = false;
 let yandexTtsConfigured = false;
-let currentTtsProvider = "yandex";
 let currentYandexVoice = "marina";
 let aiClassifierFallbackNotified = false;
 const triageCache = new Map();
@@ -250,6 +246,8 @@ let bargeInData = null;
 let bargeInStream = null;
 let bargeInProcessor = null;
 let bargeInSilentGain = null;
+let iosWakeLockOscillator = null;
+let iosWakeLockGain = null;
 let bargeInRafId = 0;
 let bargeInLastTs = 0;
 let bargeInSpeechMs = 0;
@@ -288,6 +286,7 @@ const STT_CONTINUE_MIN_RMS_THRESHOLD = 0.018;
 const STT_CONTINUE_RMS_MULTIPLIER = 1.9;
 const STT_MIN_CAPTURE_BEFORE_SILENCE_MS = 280;
 const TTS_PLAYBACK_START_TIMEOUT_MS = 5000;
+const IOS_SAFARI_AUDIO_REBUILD_DELAY_MS = 50;
 const REQUEST_TIMEOUT_MS = Object.freeze({
   ttsHealth: 2500,
   specialtyClassify: 4500,
@@ -1394,40 +1393,6 @@ function addMessage(role, text) {
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
-function rankVoice(voice) {
-  const name = String(voice?.name || "").toLowerCase();
-  let score = 0;
-  if (voice?.lang === "ru-RU") {
-    score += 80;
-  }
-  if (String(voice?.lang || "").toLowerCase().startsWith("ru")) {
-    score += 40;
-  }
-  if (name.includes("yandex")) {
-    score += 40;
-  }
-  if (name.includes("google")) {
-    score += 35;
-  }
-  if (name.includes("microsoft")) {
-    score += 25;
-  }
-  if (name.includes("alena") || name.includes("milena") || name.includes("irina") || name.includes("anna")) {
-    score += 12;
-  }
-  return score;
-}
-
-function getRussianVoices() {
-  if (!window.speechSynthesis) {
-    return [];
-  }
-  const voices = window.speechSynthesis.getVoices();
-  return voices
-    .filter((voice) => String(voice.lang || "").toLowerCase().startsWith("ru"))
-    .sort((a, b) => rankVoice(b) - rankVoice(a));
-}
-
 function prepareTextForSpeech(text) {
   let out = String(text || "");
   for (const [pattern, replacement] of speechReplacements) {
@@ -1439,6 +1404,12 @@ function prepareTextForSpeech(text) {
 function isIosSafari() {
   const ua = String(navigator.userAgent || "");
   return IOS_WEBKIT_RE.test(ua) && /WebKit/i.test(ua) && !NON_SAFARI_IOS_RE.test(ua);
+}
+
+function wait(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function buildCacheKey(...parts) {
@@ -1481,46 +1452,6 @@ function updateRateLabel() {
   if (speechRateValue) {
     speechRateValue.textContent = `${currentSpeechRate.toFixed(2)}x`;
   }
-}
-
-function populateBrowserVoiceSelect() {
-  if (!voiceSelect) {
-    return;
-  }
-
-  const ruVoices = getRussianVoices();
-  voiceSelect.innerHTML = "";
-
-  if (!ruVoices.length) {
-    const option = document.createElement("option");
-    option.textContent = "Русский голос недоступен";
-    option.value = "";
-    voiceSelect.appendChild(option);
-    voiceSelect.disabled = true;
-    selectedVoice = null;
-    selectedVoiceName = "";
-    return;
-  }
-
-  voiceSelect.disabled = false;
-  ruVoices.forEach((voice, idx) => {
-    const option = document.createElement("option");
-    option.value = String(idx);
-    option.textContent = `${voice.name} (${voice.lang})`;
-    voiceSelect.appendChild(option);
-  });
-
-  let index = 0;
-  if (selectedVoiceName) {
-    const existing = ruVoices.findIndex((voice) => voice.name === selectedVoiceName);
-    if (existing >= 0) {
-      index = existing;
-    }
-  }
-
-  voiceSelect.value = String(index);
-  selectedVoice = ruVoices[index];
-  selectedVoiceName = selectedVoice.name;
 }
 
 function populateYandexVoiceSelect() {
@@ -1886,22 +1817,9 @@ function proceedAfterSpecialtyDecision() {
   return false;
 }
 
-function resolveRussianVoice() {
-  if (selectedVoice) {
-    return selectedVoice;
-  }
-  const ruVoices = getRussianVoices();
-  selectedVoice = ruVoices[0] || null;
-  selectedVoiceName = selectedVoice ? selectedVoice.name : "";
-  return selectedVoice;
-}
-
 function clearSpeech() {
   speechSessionId += 1;
   sttSessionId += 1;
-  if (window.speechSynthesis) {
-    window.speechSynthesis.cancel();
-  }
   if (activeAudio) {
     playbackCancelledAt = Date.now();
     try {
@@ -1941,6 +1859,27 @@ function releaseBargeInResources() {
   sttPreRollChunks = [];
   sttPreRollFrames = 0;
   bargeInResumePromise = null;
+  if (iosWakeLockOscillator) {
+    try {
+      iosWakeLockOscillator.stop();
+    } catch (e) {
+      // ignore
+    }
+    try {
+      iosWakeLockOscillator.disconnect();
+    } catch (e) {
+      // ignore
+    }
+    iosWakeLockOscillator = null;
+  }
+  if (iosWakeLockGain) {
+    try {
+      iosWakeLockGain.disconnect();
+    } catch (e) {
+      // ignore
+    }
+    iosWakeLockGain = null;
+  }
   if (bargeInProcessor) {
     try {
       bargeInProcessor.disconnect();
@@ -2071,6 +2010,19 @@ async function ensureBargeInMonitor() {
       handleMicAudioChunk(chunk);
     };
     bargeInData = new Uint8Array(bargeInAnalyser.fftSize);
+    if (isIosSafari()) {
+      try {
+        iosWakeLockOscillator = bargeInAudioContext.createOscillator();
+        iosWakeLockGain = bargeInAudioContext.createGain();
+        iosWakeLockGain.gain.value = 0.00001;
+        iosWakeLockOscillator.connect(iosWakeLockGain);
+        iosWakeLockGain.connect(bargeInAudioContext.destination);
+        iosWakeLockOscillator.start();
+      } catch (e) {
+        iosWakeLockOscillator = null;
+        iosWakeLockGain = null;
+      }
+    }
     return true;
   } catch (e) {
     releaseBargeInResources();
@@ -2091,7 +2043,13 @@ async function rebuildListeningPipelineAfterSpeech() {
     return false;
   }
 
-  if (isIosSafari() && bargeInAudioContext) {
+  if (isIosSafari()) {
+    releaseBargeInResources();
+    await wait(IOS_SAFARI_AUDIO_REBUILD_DELAY_MS);
+    return ensureListeningPipelineReady();
+  }
+
+  if (bargeInAudioContext) {
     const resumed = await resumeBargeInAudioContext();
     if (resumed && hasLiveBargeInTrack() && bargeInAnalyser && bargeInData) {
       startBargeInLoop();
@@ -2282,9 +2240,6 @@ function interruptAssistantForBargeIn() {
   speechSessionId += 1;
   speechQueue = Promise.resolve();
   playbackCancelledAt = Date.now();
-  if (window.speechSynthesis) {
-    window.speechSynthesis.cancel();
-  }
   if (activeAudio) {
     try {
       activeAudio.pause();
@@ -2733,46 +2688,6 @@ function stopActiveAudioPlayback() {
   activeAudio = null;
 }
 
-function speakWithBrowser(text) {
-  return new Promise((resolve) => {
-    if (!window.speechSynthesis) {
-      resolve(false);
-      return;
-    }
-
-    try {
-      window.speechSynthesis.cancel();
-    } catch (e) {
-      // ignore cancel race
-    }
-
-    stopActiveAudioPlayback();
-
-    const utter = new SpeechSynthesisUtterance(text);
-    utter.lang = "ru-RU";
-    utter.rate = currentSpeechRate;
-    utter.pitch = 0.92;
-
-    const voice = selectedVoice || resolveRussianVoice();
-    if (voice) {
-      utter.voice = voice;
-    }
-
-    utter.onstart = () => {
-      beginAssistantSpeech();
-    };
-
-    const finish = () => {
-      endAssistantSpeech();
-      resolve(true);
-    };
-
-    utter.onend = finish;
-    utter.onerror = finish;
-    window.speechSynthesis.speak(utter);
-  });
-}
-
 async function speakWithYandex(text) {
   let audioUrl = "";
   beginAssistantSpeech();
@@ -2896,7 +2811,7 @@ async function speak(text) {
   const yandexOk = await speakWithYandex(prepared);
   if (!yandexOk) {
     stopActiveAudioPlayback();
-    void reportClientLog("tts", "Yandex TTS unavailable; browser fallback disabled");
+    void reportClientLog("tts", "Yandex TTS unavailable");
   }
 }
 
