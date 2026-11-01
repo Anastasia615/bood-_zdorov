@@ -216,6 +216,7 @@ let shouldResumeListeningAfterSpeech = false;
 let speechQueue = Promise.resolve();
 const currentSpeechRate = 1.04;
 let activeAudio = null;
+let activeTtsSourceNode = null;
 let yandexFailureNotified = false;
 let yandexTtsConfigured = false;
 let currentYandexVoice = "marina";
@@ -253,6 +254,7 @@ let bargeInLastTs = 0;
 let bargeInSpeechMs = 0;
 let bargeInNoiseFloor = 0.008;
 let bargeInResumePromise = null;
+let audioUnlockPrimed = false;
 let micInputSampleRate = 16000;
 let sttCaptureActive = false;
 let sttCaptureStartedAt = 0;
@@ -277,7 +279,7 @@ const BARGE_IN_MIN_RMS_THRESHOLD = 0.032;
 const BARGE_IN_RMS_MULTIPLIER = 3.2;
 const BARGE_IN_HOLD_MS = 320;
 const USER_SPEECH_START_HOLD_MS = 110;
-const USER_SPEECH_END_SILENCE_MS = 680;
+const USER_SPEECH_END_SILENCE_MS = 520;
 const USER_SPEECH_MAX_MS = 14000;
 const USER_SPEECH_MIN_MS = 220;
 const USER_PREROLL_MS = 180;
@@ -287,6 +289,7 @@ const STT_CONTINUE_RMS_MULTIPLIER = 1.9;
 const STT_MIN_CAPTURE_BEFORE_SILENCE_MS = 280;
 const TTS_PLAYBACK_START_TIMEOUT_MS = 5000;
 const IOS_SAFARI_AUDIO_REBUILD_DELAY_MS = 50;
+const TTS_CONTEXT_PLAYBACK_GUARD_MS = 2500;
 const REQUEST_TIMEOUT_MS = Object.freeze({
   ttsHealth: 2500,
   specialtyClassify: 4500,
@@ -1403,7 +1406,8 @@ function prepareTextForSpeech(text) {
 
 function isIosSafari() {
   const ua = String(navigator.userAgent || "");
-  return IOS_WEBKIT_RE.test(ua) && /WebKit/i.test(ua) && !NON_SAFARI_IOS_RE.test(ua);
+  const isIpadDesktopUa = navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
+  return (IOS_WEBKIT_RE.test(ua) || isIpadDesktopUa) && /WebKit/i.test(ua) && !NON_SAFARI_IOS_RE.test(ua);
 }
 
 function wait(ms) {
@@ -1921,19 +1925,72 @@ function clearBargeInGraph(preserveSession = false) {
     bargeInStream.getTracks().forEach((track) => track.stop());
     bargeInStream = null;
   }
-  if (!preserveSession && bargeInAudioContext) {
-    try {
-      bargeInAudioContext.close();
-    } catch (e) {
-      // ignore
-    }
-    bargeInAudioContext = null;
-  }
+  // The context is deliberately never closed: iOS Safari unlocks one only
+  // inside a user gesture, so a replacement built later could never run.
   bargeInData = null;
 }
 
 function releaseBargeInResources() {
   clearBargeInGraph(false);
+}
+
+function configureAudioSession() {
+  // Without a play-and-record session Safari sends playback to the earpiece
+  // while a microphone capture is live.
+  try {
+    if (navigator.audioSession) {
+      navigator.audioSession.type = "play-and-record";
+    }
+  } catch (e) {
+    // ignore unsupported audio session api
+  }
+}
+
+function ensureAudioContextCreated() {
+  if (bargeInAudioContext) {
+    return bargeInAudioContext;
+  }
+
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) {
+    return null;
+  }
+
+  try {
+    bargeInAudioContext = new Ctx();
+  } catch (e) {
+    bargeInAudioContext = null;
+  }
+
+  return bargeInAudioContext;
+}
+
+function unlockAudioFromUserGesture() {
+  configureAudioSession();
+  const ctx = ensureAudioContextCreated();
+  if (!ctx) {
+    return false;
+  }
+
+  try {
+    void ctx.resume();
+  } catch (e) {
+    // ignore resume race
+  }
+
+  if (!audioUnlockPrimed) {
+    try {
+      const primer = ctx.createBufferSource();
+      primer.buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+      primer.connect(ctx.destination);
+      primer.start(0);
+      audioUnlockPrimed = true;
+    } catch (e) {
+      // ignore priming failure
+    }
+  }
+
+  return true;
 }
 
 function hasLiveBargeInTrack() {
@@ -2039,6 +2096,11 @@ async function ensureBargeInMonitor() {
     return false;
   }
 
+  configureAudioSession();
+  if (!ensureAudioContextCreated()) {
+    return false;
+  }
+
   try {
     bargeInStream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -2048,12 +2110,6 @@ async function ensureBargeInMonitor() {
       }
     });
 
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) {
-      return false;
-    }
-
-    bargeInAudioContext = new Ctx();
     const attached = await attachBargeInGraph();
     if (attached) {
       return true;
@@ -2209,7 +2265,8 @@ async function transcribeCapturedAudio(chunks, sessionId) {
   const merged = mergeFloat32Chunks(chunks);
   const resampled = resampleFloat32Buffer(merged, micInputSampleRate, STT_TARGET_SAMPLE_RATE);
   const estimatedMs = (resampled.length / STT_TARGET_SAMPLE_RATE) * 1000;
-  if (estimatedMs < USER_SPEECH_MIN_MS) {
+  const minSpeechMs = isIosSafari() ? 120 : USER_SPEECH_MIN_MS;
+  if (estimatedMs < minSpeechMs) {
     return;
   }
 
@@ -2325,8 +2382,15 @@ function startBargeInLoop() {
       sum += centered * centered;
     }
     const rms = Math.sqrt(sum / bargeInData.length);
-    const sttStartThreshold = Math.max(BARGE_IN_MIN_RMS_THRESHOLD, bargeInNoiseFloor * BARGE_IN_RMS_MULTIPLIER);
-    const sttContinueThreshold = Math.max(STT_CONTINUE_MIN_RMS_THRESHOLD, bargeInNoiseFloor * STT_CONTINUE_RMS_MULTIPLIER);
+    const onIos = isIosSafari();
+    const startMinThreshold = onIos ? 0.018 : BARGE_IN_MIN_RMS_THRESHOLD;
+    const startMultiplier = onIos ? 2.1 : BARGE_IN_RMS_MULTIPLIER;
+    const continueMinThreshold = onIos ? 0.01 : STT_CONTINUE_MIN_RMS_THRESHOLD;
+    const continueMultiplier = onIos ? 1.4 : STT_CONTINUE_RMS_MULTIPLIER;
+    const sttStartThreshold = Math.max(startMinThreshold, bargeInNoiseFloor * startMultiplier);
+    const sttContinueThreshold = Math.max(continueMinThreshold, bargeInNoiseFloor * continueMultiplier);
+    const minCaptureBeforeSilenceMs = onIos ? 260 : STT_MIN_CAPTURE_BEFORE_SILENCE_MS;
+    const speechEndSilenceMs = onIos ? 620 : USER_SPEECH_END_SILENCE_MS;
 
     if (!isSpeaking) {
       const speechLikeRms = sttCaptureActive ? rms >= sttContinueThreshold : rms >= sttStartThreshold;
@@ -2355,9 +2419,9 @@ function startBargeInLoop() {
       } else {
         if (rms >= sttContinueThreshold) {
           sttSilenceMs = 0;
-        } else if (Date.now() - sttCaptureStartedAt >= STT_MIN_CAPTURE_BEFORE_SILENCE_MS) {
+        } else if (Date.now() - sttCaptureStartedAt >= minCaptureBeforeSilenceMs) {
           sttSilenceMs += dt;
-          if (sttSilenceMs >= USER_SPEECH_END_SILENCE_MS) {
+          if (sttSilenceMs >= speechEndSilenceMs) {
             finalizeSttCapture();
           }
         }
@@ -2370,6 +2434,12 @@ function startBargeInLoop() {
     }
 
     if (Date.now() - assistantSpeechStartedAt < BARGE_IN_ENABLE_AFTER_MS) {
+      bargeInSpeechMs = 0;
+      return;
+    }
+
+    if (onIos) {
+      // iOS Safari hears the speaker as barge-in and cuts the assistant off.
       bargeInSpeechMs = 0;
       return;
     }
@@ -2710,6 +2780,15 @@ async function endAssistantSpeech(awaitListeningPipeline = false) {
 }
 
 function stopActiveAudioPlayback() {
+  if (activeTtsSourceNode) {
+    try {
+      activeTtsSourceNode.stop(0);
+    } catch (e) {
+      // ignore stop race
+    }
+    activeTtsSourceNode = null;
+  }
+
   if (!activeAudio) {
     return;
   }
@@ -2741,6 +2820,58 @@ function stopActiveAudioPlayback() {
   activeAudio = null;
 }
 
+async function playYandexBlobViaAudioContext(audioBlob) {
+  if (!audioBlob || !bargeInAudioContext) {
+    return false;
+  }
+
+  try {
+    if (bargeInAudioContext.state !== "running") {
+      await resumeBargeInAudioContext();
+    }
+    if (bargeInAudioContext.state !== "running") {
+      return false;
+    }
+
+    const arrayBuffer = await audioBlob.arrayBuffer();
+    const decoded = await new Promise((resolve, reject) => {
+      const copy = arrayBuffer.slice(0);
+      bargeInAudioContext.decodeAudioData(copy, resolve, reject);
+    });
+
+    await new Promise((resolve) => {
+      const source = bargeInAudioContext.createBufferSource();
+      source.buffer = decoded;
+      source.connect(bargeInAudioContext.destination);
+      activeTtsSourceNode = source;
+
+      let settled = false;
+      let guardId = 0;
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(guardId);
+        if (activeTtsSourceNode === source) {
+          activeTtsSourceNode = null;
+        }
+        resolve();
+      };
+
+      // A suspended context never fires onended, which would leave isSpeaking
+      // stuck and the microphone deaf for the rest of the session.
+      guardId = setTimeout(finish, Math.round(decoded.duration * 1000) + TTS_CONTEXT_PLAYBACK_GUARD_MS);
+      source.onended = finish;
+      source.start(0);
+    });
+
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function speakWithYandex(text) {
   let audioUrl = "";
   beginAssistantSpeech();
@@ -2766,6 +2897,15 @@ async function speakWithYandex(text) {
     }
 
     const audioBlob = await response.blob();
+
+    if (bargeInAudioContext) {
+      const playedViaContext = await playYandexBlobViaAudioContext(audioBlob);
+      if (playedViaContext) {
+        yandexFailureNotified = false;
+        return true;
+      }
+    }
+
     audioUrl = URL.createObjectURL(audioBlob);
 
     await new Promise((resolve, reject) => {
@@ -3437,6 +3577,10 @@ function setupRecognition() {
 
 function toggleMic() {
   if (!micActive) {
+    // Runs before the first await on purpose: iOS Safari only unlocks audio
+    // inside the synchronous part of a user gesture.
+    unlockAudioFromUserGesture();
+
     const hasActiveConversation =
       Boolean(dialogHistory.length || state.symptoms || state.pendingSymptoms || state.specialty || state.booking || state.phone);
 
